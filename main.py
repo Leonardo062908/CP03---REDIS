@@ -1,8 +1,9 @@
 """
-redis-event-app (Partes 1 e 2)
--------------------------------
+redis-event-app (Partes 1, 2 e 3)
+---------------------------------
 Parte 1: Cache de dados de evento com Redis (GET/SETEX)
 Parte 2: Fila de notificações (LPUSH + BRPOP)
+Parte 3: Pub/Sub de atualizações de evento (PUBLISH/SUBSCRIBE)
 
 Execução do Redis (Docker):
     docker run --name redis-local -p 6379:6379 -d redis
@@ -22,6 +23,12 @@ Uso (exemplos):
     # Lote (JSON Lines com {"user": "...", "message":"..."} por linha):
     python main.py notify enqueue-batch --file msgs.jsonl
 
+    # --- Parte 3 (Pub/Sub) ---
+    # Terminal A (assinante):
+    python main.py events subscribe
+    # Terminal B (publicador de um evento existente no banco simulado):
+    python main.py events publish --id 101
+
 Variável de ambiente suportada:
     REDIS_URL (padrão: redis://localhost:6379/0)
 """
@@ -37,7 +44,7 @@ import redis
 
 DEFAULT_TTL = 60
 QUEUE_KEY = "notificacao:fila"
-PUBSUB_CHANNEL = "eventos:atualizacoes"  # reservado para a Parte 3
+PUBSUB_CHANNEL = "eventos:atualizacoes"
 
 # --- "Fonte simulada" em memória (exigido pelo enunciado) --------------------
 EVENTS_DB = {
@@ -246,12 +253,96 @@ def cmd_notify_worker(args: argparse.Namespace) -> None:
         print(f"[ERRO] Não foi possível conectar ao Redis: {e}")
 
 # ===============================
+# Parte 3 — Pub/Sub
+# ===============================
+
+def publish_update(event_id: str, r: Optional[redis.Redis] = None) -> Optional[int]:
+    """
+    Publica atualização de evento no canal PUBSUB_CHANNEL.
+    Mensagem contém: event_id, titulo e timestamp.
+    Retorna número de assinantes que receberam (inteiro) ou None em caso de erro.
+    """
+    if r is None:
+        r = get_redis_client()
+
+    event, _ = get_event(event_id, r=r)  # reusa cache/fonte simulada
+    if event is None:
+        print(json.dumps({"error": f"Evento {event_id} não encontrado."}, ensure_ascii=False, indent=2))
+        return None
+
+    payload = {
+        "event_id": event["event_id"],
+        "titulo": event["titulo"],
+        "ts": now_iso(),
+    }
+    receivers = r.publish(PUBSUB_CHANNEL, json.dumps(payload, ensure_ascii=False))
+    logging.info("PUBLISH -> canal=%s, receivers=%s, payload=%s", PUBSUB_CHANNEL, receivers, payload)
+    return receivers
+
+def subscribe_updates(r: Optional[redis.Redis] = None) -> None:
+    """
+    Assina o canal PUBSUB_CHANNEL e imprime todas as mensagens recebidas.
+    Ctrl+C para sair.
+    """
+    if r is None:
+        r = get_redis_client()
+
+    pubsub = r.pubsub(ignore_subscribe_messages=True)
+    pubsub.subscribe(PUBSUB_CHANNEL)
+    print(f"[subscriber] Inscrito em '{PUBSUB_CHANNEL}'. Aguardando mensagens... (Ctrl+C para sair)")
+
+    try:
+        for msg in pubsub.listen():
+            if msg is None:
+                continue
+            if msg.get("type") != "message":
+                continue
+            data_raw = msg.get("data")
+            try:
+                data = json.loads(data_raw)
+            except (TypeError, json.JSONDecodeError):
+                data = {"raw": data_raw}
+            print(json.dumps({
+                "channel": msg.get("channel"),
+                "received_at": now_iso(),
+                "message": data
+            }, ensure_ascii=False, indent=2))
+    except KeyboardInterrupt:
+        print("\n[subscriber] Encerrando assinatura. Até mais!")
+    finally:
+        try:
+            pubsub.close()
+        except Exception:
+            pass
+
+def cmd_events_publish(args: argparse.Namespace) -> None:
+    r = get_redis_client()
+    try:
+        receivers = publish_update(args.id, r=r)
+    except redis.exceptions.ConnectionError as e:
+        print(f"[ERRO] Não foi possível conectar ao Redis: {e}")
+        return
+    if receivers is not None:
+        print(json.dumps({
+            "status": "published",
+            "channel": PUBSUB_CHANNEL,
+            "event_id": args.id,
+            "receivers": receivers
+        }, ensure_ascii=False, indent=2))
+
+def cmd_events_subscribe(args: argparse.Namespace) -> None:
+    try:
+        subscribe_updates()
+    except redis.exceptions.ConnectionError as e:
+        print(f"[ERRO] Não foi possível conectar ao Redis: {e}")
+
+# ===============================
 # CLI
 # ===============================
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="redis-event-app — Partes 1 (Cache) e 2 (Fila de notificações)",
+        description="redis-event-app — Partes 1 (Cache), 2 (Fila) e 3 (Pub/Sub)",
     )
     parser.add_argument("--log-level", default="INFO", help="Nível de log (DEBUG, INFO, WARNING, ERROR)")
 
@@ -286,6 +377,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_worker = sub_notify.add_parser("worker", help="Processa a fila de forma bloqueante (BRPOP)")
     p_worker.set_defaults(func=cmd_notify_worker)
+
+    # Subcomando: events (pub/sub)
+    p_events = sub.add_parser("events", help="Pub/Sub de atualizações de evento")
+    sub_events = p_events.add_subparsers(dest="events_cmd", required=True)
+
+    p_pub = sub_events.add_parser("publish", help="Publica atualização no canal eventos:atualizacoes")
+    p_pub.add_argument("--id", required=True, help="ID do evento a publicar")
+    p_pub.set_defaults(func=cmd_events_publish)
+
+    p_sub = sub_events.add_parser("subscribe", help="Assina o canal eventos:atualizacoes e imprime mensagens")
+    p_sub.set_defaults(func=cmd_events_subscribe)
 
     return parser
 
